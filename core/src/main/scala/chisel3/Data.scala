@@ -214,8 +214,12 @@ private[chisel3] object getRecursiveFields {
 private[chisel3] object getMatchedFields {
   def apply(x: Data, y: Data): Seq[(Data, Data)] = (x, y) match {
     case (x: Element, y: Element) =>
-      require(x.typeEquivalent(y))
+      x.requireTypeEquivalent(y)
       Seq(x -> y)
+    case (_, _) if DataMirror.hasProbeTypeModifier(x) || DataMirror.hasProbeTypeModifier(y) => {
+      x.requireTypeEquivalent(y)
+      Seq(x -> y)
+    }
     case (x: Record, y: Record) =>
       (x._elements
         .zip(y._elements))
@@ -595,9 +599,22 @@ abstract class Data extends HasId with NamedComponent with SourceInfoDoc {
         }
       }
 
-    val leftType = if (this.hasBinding) this.cloneType else this
-    val rightType = if (that.hasBinding) that.cloneType else that
-    rec(leftType, rightType)
+    rec(this, that)
+  }
+
+  /** Require that two things are type equivalent, and if they are not, print a helpful error message as
+    * to why not.
+    */
+  private[chisel3] def requireTypeEquivalent(that: Data): Unit = {
+    require(
+      this.typeEquivalent(that), {
+        val reason = this
+          .findFirstTypeMismatch(that, strictTypes = true, strictWidths = true, strictProbeInfo = true)
+          .map(s => s"\nbecause $s")
+          .getOrElse("")
+        s"$this is not typeEquivalent to $that$reason"
+      }
+    )
   }
 
   private[chisel3] def isVisible: Boolean = isVisibleFromModule && visibleFromWhen.isEmpty
@@ -658,11 +675,12 @@ abstract class Data extends HasId with NamedComponent with SourceInfoDoc {
     topBindingOpt match {
       // DataView
       case Some(ViewBinding(target)) => reify(target).ref
-      case Some(AggregateViewBinding(viewMap)) =>
-        viewMap.get(this) match {
-          case None => materializeWire() // FIXME FIRRTL doesn't have Aggregate Init expressions
-          // This should not be possible because Element does the lookup in .topBindingOpt
-          case x: Some[_] => throwException(s"Internal Error: In .ref for $this got '$topBindingOpt' and '$x'")
+      case Some(_: AggregateViewBinding) =>
+        reifySingleData(this) match {
+          // If this is an identity view (a view of something of the same type), return ref of target
+          case Some(target) if this.typeEquivalent(target) => target.ref
+          // Otherwise, we need to materialize hardware of the correct type
+          case _ => materializeWire()
         }
       // Literals
       case Some(ElementLitBinding(litArg)) => litArg

@@ -1118,14 +1118,14 @@ abstract class Record extends Aggregate {
     * )
     * }}}
     */
-  private[chisel3] def _makeLit(elems: (this.type => (Data, Data))*): this.type = {
+  private[chisel3] def _makeLit(elems: (this.type => (Data, Data))*)(implicit sourceInfo: SourceInfo): this.type = {
 
     requireIsChiselType(this, "bundle literal constructor model")
     val clone = cloneType
-    val cloneFields = getRecursiveFields(clone, "(bundle root)").toMap
+    val cloneFields = getRecursiveFields(clone, "_").toMap
 
     // Create the Bundle literal binding from litargs of arguments
-    val bundleLitMap = elems.map { fn => fn(clone) }.flatMap {
+    val bundleLitMapping = elems.map { fn => fn(clone) }.flatMap {
       case (field, value) =>
         val fieldName = cloneFields.getOrElse(
           field,
@@ -1207,12 +1207,36 @@ abstract class Record extends Aggregate {
     }
 
     // don't convert to a Map yet to preserve duplicate keys
-    val duplicates = bundleLitMap.map(_._1).groupBy(identity).collect { case (x, elts) if elts.size > 1 => x }
+    val duplicates = bundleLitMapping.map(_._1).groupBy(identity).collect { case (x, elts) if elts.size > 1 => x }
     if (!duplicates.isEmpty) {
       val duplicateNames = duplicates.map(cloneFields(_)).mkString(", ")
       throw new BundleLiteralException(s"duplicate fields $duplicateNames in Bundle literal constructor")
     }
-    clone.bind(BundleLitBinding(bundleLitMap.toMap))
+    // Check widths and sign extend as appropriate.
+    val bundleLitMap = bundleLitMapping.view.map {
+      case (field, value) =>
+        field.width match {
+          // If width is unknown, then it is set by the literal value.
+          case UnknownWidth() => field -> value
+          case width @ KnownWidth(widthValue) =>
+            val valuex = if (widthValue < value.width.get) {
+              // For legacy reasons, 0.U is 1-bit, don't warn when it comes up as a literal value for 0-bit Bundle lit field.
+              val dontWarnOnZeroDotU = widthValue == 0 && value.num == 0 && value.width.get == 1
+              if (!dontWarnOnZeroDotU) {
+                val msg = s"Literal value $value is too wide for field ${cloneFields(field)} with width $widthValue"
+                Builder.warning(Warning(WarningID.BundleLiteralValueTooWide, msg))
+              }
+              // Mask the value to the width of the field.
+              val mask = (BigInt(1) << widthValue) - 1
+              value.cloneWithValue(value.num & mask).cloneWithWidth(width)
+            } else if (widthValue > value.width.get) value.cloneWithWidth(width)
+            // Otherwise, ensure width is same as that of the field.
+            else value
+
+            field -> valuex
+        }
+    }.toMap
+    clone.bind(BundleLitBinding(bundleLitMap))
     clone
   }
 
