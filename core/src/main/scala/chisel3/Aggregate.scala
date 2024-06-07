@@ -44,6 +44,15 @@ sealed abstract class Aggregate extends Data {
     }
 
     topBindingOpt match {
+      // Don't accidentally invent a literal value for a view that is empty
+      case Some(_: AggregateViewBinding) if this.getElements.isEmpty =>
+        reifySingleData(this) match {
+          case Some(target: Aggregate) => target.checkingLitOption(checkForDontCares)
+          case _ =>
+            val msg =
+              s"It should not be possible to have an empty Aggregate view that doesn't reify to a single target, but got $this"
+            Builder.exception(msg)(UnlocatableSourceInfo)
+        }
       case Some(_: BundleLitBinding | _: VecLitBinding | _: AggregateViewBinding) =>
         // Records store elements in reverse order and higher indices are more significant in Vecs
         this.getElements.foldRight(Option(BigInt(0)))(shiftAdd)
@@ -96,8 +105,14 @@ sealed abstract class Aggregate extends Data {
   // This means we need the `first` argument so that we can preserve this behavior of Aggregates while still allowing subclasses
   // to override .asUInt behavior
   override private[chisel3] def _asUIntImpl(first: Boolean)(implicit sourceInfo: SourceInfo): UInt = {
-    val elts = this.getElements.map(_._asUIntImpl(false))
-    if (elts.isEmpty && !first) 0.U(0.W) else SeqUtils.do_asUInt(elts)
+    checkingLitOption(checkForDontCares = false) match {
+      case Some(value) =>
+        // Using UInt.Lit instead of .U so we can use Width argument which may be Unknown
+        UInt.Lit(value, this.width)
+      case None =>
+        val elts = this.getElements.map(_._asUIntImpl(false))
+        if (elts.isEmpty && !first) 0.U(0.W) else SeqUtils.do_asUInt(elts)
+    }
   }
 
   private[chisel3] override def connectFromBits(
@@ -320,7 +335,7 @@ sealed class Vec[T <: Data] private[chisel3] (gen: => T, val length: Int) extend
     }
 
     if (length == 0) {
-      Builder.warning(Warning(WarningID.ExtractFromVecSizeZero, s"Cannot extra from Vec of size 0."))
+      Builder.warning(Warning(WarningID.ExtractFromVecSizeZero, s"Cannot extract from Vec of size 0."))
     } else {
       p.widthOption.foreach { pWidth =>
         val correctWidth = BigInt(length - 1).bitLength
@@ -489,7 +504,6 @@ sealed class Vec[T <: Data] private[chisel3] (gen: => T, val length: Int) extend
             s"are less than zero or greater or equal to than Vec length"
         )
       }
-      cloneSupertype(elementInitializers.map(_._2), s"Vec.Lit(...)")
 
       // look for literals of this vec that are wider than the vec's type
       val badLits = elementInitializers.flatMap {
@@ -1110,14 +1124,14 @@ abstract class Record extends Aggregate {
     * )
     * }}}
     */
-  private[chisel3] def _makeLit(elems: (this.type => (Data, Data))*): this.type = {
+  private[chisel3] def _makeLit(elems: (this.type => (Data, Data))*)(implicit sourceInfo: SourceInfo): this.type = {
 
     requireIsChiselType(this, "bundle literal constructor model")
     val clone = cloneType
-    val cloneFields = getRecursiveFields(clone, "(bundle root)").toMap
+    val cloneFields = getRecursiveFields(clone, "_").toMap
 
     // Create the Bundle literal binding from litargs of arguments
-    val bundleLitMap = elems.map { fn => fn(clone) }.flatMap {
+    val bundleLitMapping = elems.map { fn => fn(clone) }.flatMap {
       case (field, value) =>
         val fieldName = cloneFields.getOrElse(
           field,
@@ -1199,12 +1213,36 @@ abstract class Record extends Aggregate {
     }
 
     // don't convert to a Map yet to preserve duplicate keys
-    val duplicates = bundleLitMap.map(_._1).groupBy(identity).collect { case (x, elts) if elts.size > 1 => x }
+    val duplicates = bundleLitMapping.map(_._1).groupBy(identity).collect { case (x, elts) if elts.size > 1 => x }
     if (!duplicates.isEmpty) {
       val duplicateNames = duplicates.map(cloneFields(_)).mkString(", ")
       throw new BundleLiteralException(s"duplicate fields $duplicateNames in Bundle literal constructor")
     }
-    clone.bind(BundleLitBinding(bundleLitMap.toMap))
+    // Check widths and sign extend as appropriate.
+    val bundleLitMap = bundleLitMapping.view.map {
+      case (field, value) =>
+        field.width match {
+          // If width is unknown, then it is set by the literal value.
+          case UnknownWidth() => field -> value
+          case width @ KnownWidth(widthValue) =>
+            val valuex = if (widthValue < value.width.get) {
+              // For legacy reasons, 0.U is 1-bit, don't warn when it comes up as a literal value for 0-bit Bundle lit field.
+              val dontWarnOnZeroDotU = widthValue == 0 && value.num == 0 && value.width.get == 1
+              if (!dontWarnOnZeroDotU) {
+                val msg = s"Literal value $value is too wide for field ${cloneFields(field)} with width $widthValue"
+                Builder.warning(Warning(WarningID.BundleLiteralValueTooWide, msg))
+              }
+              // Mask the value to the width of the field.
+              val mask = (BigInt(1) << widthValue) - 1
+              value.cloneWithValue(value.num & mask).cloneWithWidth(width)
+            } else if (widthValue > value.width.get) value.cloneWithWidth(width)
+            // Otherwise, ensure width is same as that of the field.
+            else value
+
+            field -> valuex
+        }
+    }.toMap
+    clone.bind(BundleLitBinding(bundleLitMap))
     clone
   }
 
